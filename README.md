@@ -1,73 +1,63 @@
-# rt-micro-benchmarks
+# Fused LayerNorm + GELU
 
-Three small, self-contained benchmarks covering the two halves of putting a
-learned policy on a robot: getting the model fast enough on the GPU, and
-getting the control loop around it to behave deterministically on the CPU.
+LayerNorm followed by GELU is everywhere in a transformer. Run as two ops it
+costs four passes over HBM:
 
-Each one is independent, runs in minutes, and produces a number and a plot.
+```
+read x -> write y        (layer_norm)
+read y -> write z        (gelu)
+```
 
-| | what it measures | stack |
-|---|---|---|
-| [01-fused-cuda-kernel](01-fused-cuda-kernel/) | HBM traffic saved by fusing LayerNorm+GELU into one kernel | CUDA, PyTorch extension |
-| [02-rt-loop-jitter](02-rt-loop-jitter/) | wake-up jitter of a periodic loop, and what `SCHED_FIFO` / affinity / `mlockall` each buy | C++17, Linux |
-| [03-ipc-latency](03-ipc-latency/) | round-trip latency of shared memory vs socketpair vs pipes | C++17, Linux |
+The arithmetic is trivial, so the kernel is bandwidth bound and those extra two
+passes *are* the runtime. Fusing gets it to read-once, write-once, and drops a
+kernel launch.
 
-## Why these three
+```
+read x -> write z        (fused)
+```
 
-A policy that takes 40 ms to run is useless in a 100 Hz loop, so (01) is about
-the inference budget. But a policy that runs in 2 ms is *also* useless if the
-loop that calls it wakes up 300 µs late one iteration in a thousand, so (02) is
-about the loop. And if the safety supervisor lives in a separate process — it
-should, so that a hung inference process cannot take the estop with it — then
-the cost of talking to it is on the critical path, which is (03).
+Ceiling is therefore ~2x on large shapes, less on small ones where launch
+overhead rather than bandwidth dominates.
 
-Together they cover the latency budget of a real control stack end to end.
-
-## Quick start
+## Build and run
 
 ```bash
-# 01 — needs an NVIDIA GPU
-cd 01-fused-cuda-kernel
 python setup.py build_ext --inplace
-python benchmark.py --out results.csv && python plot_results.py
-
-# 02 — Linux. RT modes need privileges.
-cd 02-rt-loop-jitter && make
-./rt_loop --hz 1000 --sec 10 --out plain.csv
-sudo ./rt_loop --hz 1000 --sec 10 --rt 80 --cpu 2 --mlock --out rt.csv
-python plot_jitter.py plain.csv rt.csv
-
-# 03 — Linux, needs >= 2 cores for the busy-spin mode
-cd 03-ipc-latency && make
-make sweep && python plot_latency.py shm.csv socket.csv pipe.csv
+python benchmark.py --out results.csv
+python plot_results.py --csv results.csv --out speedup.png
 ```
 
-Requirements: `g++` with C++17, Python with `matplotlib` + `numpy`, and for 01,
-a CUDA toolkit and a PyTorch build that matches it.
+Add `--compile` to also time `torch.compile`, which fuses these itself — a
+fairer opponent than eager, and the one worth beating.
 
-## Reading the results
+## What it does
 
-Every one of these reports percentiles, not averages. In a control loop the
-mean is close to meaningless — what breaks the robot is the one iteration in a
-thousand that arrives late. All three tools print p50 / p99 / p99.9 / max and
-plot the tail on a log axis for that reason.
+`fused_layernorm_gelu.cu` — one block per row. Warp-shuffle reduction for mean
+and variance, block-level reduction across warps, then a second pass that
+normalizes, applies the affine transform, runs GELU, and writes out. Block
+size adapts to hidden dim.
 
-## A finding worth keeping
+`benchmark.py` — sweeps shapes from launch-bound to bandwidth-bound. Uses CUDA
+events, warms up before timing, reports median over 100 iterations, and
+verifies against the PyTorch reference before timing anything. Also reports
+achieved GB/s so you can see how close to the memory roofline you are.
 
-Running 03 inside a 1-core container:
+Correctness tolerance is 2e-3 relative. `--use_fast_math` changes `tanhf`
+slightly, so bit-exactness is not the goal.
 
-```
-mode=shm  (busy-spin)   p50  7999.885 µs
-mode=shmy (sched_yield) p50     1.397 µs
-mode=socket             p50     3.817 µs
-```
+## Where to take it next
 
-Busy-spin shared memory came out ~2000x *slower* than a Unix socket. Nothing
-is wrong with the shared-memory path: with one core online, the spinning
-parent burns its entire timeslice before the child is ever scheduled to answer.
-Spin-waiting is only a latency win when each participant owns a core.
-
-This is the kind of result that quietly poisons a benchmark, so `ipc_latency`
-now detects the condition and warns instead of printing a confident wrong
-number. Worth remembering before reaching for shared memory on an embedded
-target with two cores and a busy scheduler.
+- **`float4` vectorized loads** when `H % 4 == 0`. The scalar loop is the
+  obvious first thing to fix; on a memory-bound kernel this is usually the
+  single biggest remaining win.
+- **fp16 / bf16**, accumulating statistics in fp32. This is what you actually
+  run in production, and it changes the bandwidth math by 2x.
+- **Welford** for the variance. The `E[x²] − E[x]²` form is fine in fp32 but
+  loses precision once inputs get large or you accumulate in half precision.
+- **Backward pass**, if you want it usable for training rather than inference.
+- **Profile with `ncu`**: `ncu --set full python benchmark.py`. The build
+  already passes `-lineinfo`, so stalls map back to source lines. Check
+  `dram__bytes.sum` against the theoretical minimum — if the fused kernel is
+  moving more than `2 * N * H * 4` bytes, something is reading twice.
+- **Compare against `torch.compile`** on your actual shapes. If Inductor wins,
+  read its generated Triton and find out why.
